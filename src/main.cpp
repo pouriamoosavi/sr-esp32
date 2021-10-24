@@ -49,6 +49,12 @@ const uint8_t RES_CODE_ERR_WIFI_FAILED = 0b00000010;
 const char* ST_SSID_KEY = "stSsid";
 const char* ST_PASS_KEY = "stPass";
 
+String tmpPass = "";
+
+const uint8_t waitForConnectSeconds = 10;
+
+const char* lastPendingResponse = "lpr";
+
 void printArray(byte *input, int len){
   int i;
   for(i=0; i< len; i++){
@@ -64,6 +70,9 @@ void reconnectSt(WiFiEvent_t event, WiFiEventInfo_t info) {
   String stSsid = preferences.getString(ST_SSID_KEY);
   if(stSsid.length()) {
     String stPass = preferences.getString(ST_PASS_KEY);
+    Serial.print("Try reconnect with ");
+    Serial.print(stSsid);
+    Serial.println(" " + stPass);
     WiFi.begin(stSsid.c_str(), stPass.c_str());
   }
 }
@@ -74,7 +83,7 @@ bool connectST(String stSsid, String stPass, wifi_mode_t mode) {
 
   int waitForConnect = 0;
   while(WiFi.status() != WL_CONNECTED){
-    if(waitForConnect >= 600) {
+    if(waitForConnect >= (waitForConnectSeconds*10)) {
       return false;
     }
     waitForConnect++;
@@ -85,6 +94,21 @@ bool connectST(String stSsid, String stPass, wifi_mode_t mode) {
   return true;
 }
 
+void resData(String data) {
+  Serial.print("remoteClient.connected(): ");
+  Serial.println(remoteClient.connected());
+  Serial.print("For writing: ");
+  Serial.println(data);
+  if(!remoteClient.connected()) {
+    preferences.putString(lastPendingResponse, data);
+    return;
+  }
+  uint len = data.length()+1;
+  char dataArr[len];
+  data.toCharArray(dataArr, len);
+  remoteClient.write((uint8_t*)dataArr, len);
+}
+
 void checkForConnections() {
   if (server.hasClient()) {
     if (remoteClient.connected()) {
@@ -93,6 +117,11 @@ void checkForConnections() {
     } else {
       Serial.println("Connection accepted");
       remoteClient = server.available();
+      String lpr = preferences.getString(lastPendingResponse);
+      if(lpr.length() > 0) {
+        resData(lpr);
+        preferences.remove(lastPendingResponse);
+      }
     }
   }
 }
@@ -108,48 +137,50 @@ bool readFromSocket() {
       return true;
     } else {
       commandOP = inputCommand.substring(0, indexOfSpace);
-      commandInput = inputCommand.substring(indexOfSpace);
+      commandInput = inputCommand.substring(indexOfSpace+1);
       return true;
     }
   }
   return false;
 }
 
-void resData(String data) {
-  uint len = data.length()+1;
-  char dataArr[len];
-  data.toCharArray(dataArr, len);
-  remoteClient.write((uint8_t*)dataArr, len);
-}
-
 void act() {
   if(commandOP == OP_SET_ST_SSID) {
-    Serial.print("ssid: ");
+    Serial.print("ssid:");
     Serial.println(commandInput);
     preferences.putString(ST_SSID_KEY, commandInput);
-    String output = "{\"code\":0, \"op\":\"" + commandOP;
+    String output = "{\"code\":0,\"op\":\"" + commandOP;
     output += "\"}";
     resData(output);
+    return;
 
   } else if (commandOP == OP_SET_ST_PASS) {
-    Serial.print("pass: ");
+    Serial.print("pass:");
     Serial.println(commandInput);
-    preferences.putString(ST_PASS_KEY, commandInput);
-    String output = "{\"code\":0, \"op\":\"" + commandOP;
+    tmpPass = commandInput;
+    // preferences.putString(ST_PASS_KEY, commandInput);
+    String output = "{\"code\":0,\"op\":\"" + commandOP;
     output += "\"}";
     resData(output);
+    return;
 
   } else if (commandOP == OP_CONNECT_TO_ST) {
-    bool connected = connectST(preferences.getString(ST_SSID_KEY), preferences.getString(ST_PASS_KEY), WIFI_AP_STA);
+    remoteClient.flush();
+    remoteClient.stop();
+    bool connected = connectST(preferences.getString(ST_SSID_KEY), tmpPass, WIFI_AP_STA);
     if(!connected) {
-      String output = "{\"code\":" + RES_CODE_ERR_WIFI_FAILED;
-      output += "}";
+      String output = String("{\"code\":") + String(RES_CODE_ERR_WIFI_FAILED) + ",\"op\":\"" + commandOP + "\"}";
       resData(output);
+      return;
+
     } else {
+      preferences.putString(ST_PASS_KEY, tmpPass);
+      tmpPass = "";
       String ip = WiFi.localIP().toString();
-      String output = "{\"code\":0,\"localIP\":\"" + ip;
-      output += "\"}";
+      String output = "{\"code\":0,\"localIP\":\"" + ip + "\",\"op\":\"" + commandOP + "\"}";
       resData(output);
+      return;
+
     }
 
   } else if (commandOP == OP_RESET) {
@@ -157,12 +188,13 @@ void act() {
     output += "\"}";
     resData(output);
     ESP.restart();
+    return;
 
   } else if (commandOP == OP_DISABLE_AP) {
     String output = "{\"code\":0,\"op\":\"" + commandOP;
     output += "\"}";
-    // TODO make sure it does not disconnect the wifi from station.
     WiFi.mode(WIFI_STA);
+    return;
 
   } else if (commandOP == OP_STATUS) {
     String status = "{\"code\":0,\"op\":\"" + commandOP;
@@ -173,6 +205,7 @@ void act() {
     status += "\",\"localIP\":\"" + WiFi.localIP();
     status += "\"}";
     resData(status);
+    return;
 
   } else if (commandOP == OP_SCAN) {
     int n = WiFi.scanNetworks();
@@ -194,10 +227,13 @@ void act() {
     Serial.println("result: ===============");
     Serial.println(output);
     resData(output);
+    return;
+
   } else {
-    String output = "{\"code\":" + RES_CODE_ERR_404;
+    String output = String("{\"code\":" + RES_CODE_ERR_404);
     output += (",\"op\":\"" + commandOP + "}");
     resData(output);
+    return;
   }
 }
 
@@ -213,7 +249,7 @@ void startNetwork() {
   String stSsid = preferences.getString(ST_SSID_KEY);
   if(stSsid.length()) {
     String stPass = preferences.getString(ST_PASS_KEY);
-    if(!connectST(stSsid, stPass, WIFI_STA)) {
+    if(!connectST(stSsid, stPass, WIFI_AP_STA)) {
       createAPAndST();
     }
   } else {
@@ -223,9 +259,11 @@ void startNetwork() {
 
 void setup() {
   Serial.begin(115200);
-  delay(300);
-  preferences.begin("sr", false); 
+  delay(500);
+  preferences.begin("sr", false);
+  preferences.clear();
 
+  delay(200);
   Serial.println(preferences.getString(ST_SSID_KEY));
   Serial.println(preferences.getString(ST_PASS_KEY));
   startNetwork();
